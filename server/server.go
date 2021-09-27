@@ -3,63 +3,84 @@ package server
 import (
 	"errors"
 	"fmt"
+	"io/ioutil"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/golang/glog"
 	"github.com/gorilla/mux"
-	"github.com/gorilla/sessions"
-	"github.com/ory/hydra/sdk/go/hydra"
-	"github.com/ory/hydra/sdk/go/hydra/swagger"
+	"github.com/ory/hydra-client-go/client"
+	"github.com/ory/hydra-client-go/client/admin"
+	"github.com/ory/hydra-client-go/models"
 	"github.com/pragkent/hydra-wework/wework"
+	"gopkg.in/yaml.v2"
 )
 
 const (
 	openIDScope      = "openid"
 	userAgentKeyword = "wxwork"
 
+	pathLogin    = "/wework/login"
 	pathConsent  = "/wework/consent"
 	pathAuth     = "/wework/auth"
 	pathCallback = "/wework/callback"
 )
 
 type Server struct {
-	cfg   *Config
-	mux   *mux.Router
-	hcli  hydra.SDK
-	wcli  *wework.Client
-	store sessions.Store
+	cfg    *Config
+	mux    *mux.Router
+	hcli   admin.ClientService
+	wcli   *wework.Client
+	groups map[string][]string
 }
 
 func New(c *Config) (*Server, error) {
-	hcli, err := hydra.NewSDK(&hydra.Configuration{
-		ClientID:     c.HydraClientID,
-		ClientSecret: c.HydraClientSecret,
-		EndpointURL:  c.HydraURL,
-		Scopes:       []string{"hydra.consent", "hydra.warden.groups"},
-	})
-
+	adminURL, err := url.Parse(c.HydraURL)
 	if err != nil {
 		return nil, err
 	}
 
-	store := sessions.NewCookieStore([]byte(c.CookieSecret))
-	store.MaxAge(86400)
+	hydraClient := client.NewHTTPClientWithConfig(nil,
+		&client.TransportConfig{
+			Schemes:  []string{adminURL.Scheme},
+			Host:     adminURL.Host,
+			BasePath: adminURL.Path,
+		},
+	)
 
 	srv := &Server{
-		cfg:   c,
-		mux:   mux.NewRouter(),
-		hcli:  hcli,
-		wcli:  wework.NewClient(c.WeworkCorpID, c.WeworkAgentID, c.WeworkSecret),
-		store: store,
+		cfg:    c,
+		mux:    mux.NewRouter(),
+		hcli:   hydraClient.Admin,
+		wcli:   wework.NewClient(c.WeworkCorpID, c.WeworkAgentID, c.WeworkSecret),
+		groups: make(map[string][]string),
+	}
+	if err = srv.readConfig(c.GroupConfigPath); err != nil {
+		return nil, err
 	}
 
+	srv.mux.HandleFunc(pathLogin, srv.LoginHandler)
 	srv.mux.HandleFunc(pathConsent, srv.ConsentHandler)
 	srv.mux.HandleFunc(pathAuth, srv.AuthHandler)
 	srv.mux.HandleFunc(pathCallback, srv.CallbackHandler)
 
 	return srv, nil
+}
+
+func (s *Server) readConfig(path string) error {
+	bs, err := ioutil.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("config.yaml: read file error: %v", err)
+	}
+
+	err = yaml.Unmarshal(bs, s.groups)
+	if err != nil {
+		return fmt.Errorf("config.yaml: unmarshal error: %v", err)
+	}
+
+	return nil
 }
 
 func (s *Server) ListenAndServe() error {
@@ -72,96 +93,90 @@ func (s *Server) ListenAndServe() error {
 	return http.Serve(lis, s.mux)
 }
 
-func (s *Server) ConsentHandler(w http.ResponseWriter, r *http.Request) {
-	reqID := consentID(r)
-	if reqID == "" {
-		glog.Errorf("Consent request id is missing")
-		http.Error(w, "Consent request id is missing", http.StatusBadRequest)
+func (s *Server) LoginHandler(w http.ResponseWriter, r *http.Request) {
+	loginChallenge := strings.TrimSpace(loginChallengeID(r))
+	if loginChallenge == "" {
+		glog.Errorf("Login Challenge request id is missing")
+		http.Error(w, "Login Challenge request id is missing", http.StatusBadRequest)
 		return
 	}
 
-	request, response, err := s.hcli.GetOAuth2ConsentRequest(reqID)
+	loginGetParam := admin.NewGetLoginRequestParams()
+	loginGetParam.WithContext(r.Context())
+	loginGetParam.SetLoginChallenge(loginChallenge)
+
+	respLoginGet, err := s.hcli.GetLoginRequest(loginGetParam)
 	if err != nil {
-		glog.Errorf("Get consent request failed. %v", err)
-		http.Error(w, "Get consent request failed", http.StatusBadRequest)
+		glog.Errorf("Failed When Get Login Request Info : %s", err)
+		http.Error(w, "Failed When Get Login Request Info", http.StatusBadRequest)
 		return
 	}
 
-	if response.StatusCode != http.StatusOK {
-		glog.Errorf("Get consent request unexpected http status: %v", response.Status)
-		http.Error(w, "Get consent request error", http.StatusBadRequest)
+	payload := respLoginGet.GetPayload()
+	if payload.Skip != nil && *payload.Skip {
+		// 有登录态, 直接从登录态获取Sub
+		s.acceptLoginRequest(w, r, *payload.Subject, loginChallenge)
 		return
 	}
 
-	session := s.session(r)
-	uid, ok := session.Values["uid"].(string)
-	if !ok || uid == "" {
-		glog.Errorf("User not signed in")
-		http.Redirect(w, r, getAuthURL(consentID(r)), http.StatusFound)
-		return
-	}
-
-	extraVars, err := s.getTokenVars(uid)
-	if err != nil {
-		glog.Errorf("Get token extra vars error: %v", err)
-		http.Error(w, "Get user profile error", http.StatusInternalServerError)
-		return
-	}
-
-	response, err = s.hcli.AcceptOAuth2ConsentRequest(
-		reqID,
-		swagger.ConsentRequestAcceptance{
-			Subject:          subjectOf(uid),
-			GrantScopes:      getScopes(request.RequestedScopes),
-			AccessTokenExtra: extraVars,
-			IdTokenExtra:     extraVars,
-		})
-
-	if err != nil {
-		glog.Errorf("Accept consent request failed. %v", err)
-		http.Error(w, "Accept consent request error", http.StatusInternalServerError)
-		return
-	}
-
-	if response.StatusCode != http.StatusNoContent {
-		glog.Errorf("Accept consent request unexpected http status: %v", response.Status)
-		http.Error(w, "Accept consent request error", http.StatusInternalServerError)
-		return
-	}
-
-	http.Redirect(w, r, request.RedirectUrl, http.StatusFound)
+	// 跳转到企业微信授权
+	http.Redirect(w, r, getAuthURL(loginChallenge), http.StatusFound)
 }
 
-func subjectOf(uid string) string {
-	return "user:" + uid
+func (s *Server) ConsentHandler(w http.ResponseWriter, r *http.Request) {
+	consentChallenge := strings.TrimSpace(consentID(r))
+	if consentChallenge == "" {
+		glog.Errorf("Consent Challenge request id is missing")
+		http.Error(w, "Consent Challenge request id is missing", http.StatusBadRequest)
+		return
+	}
+
+	consentGetParams := admin.NewGetConsentRequestParams()
+	consentGetParams.WithContext(r.Context())
+	consentGetParams.SetConsentChallenge(consentChallenge)
+
+	consentGetResp, err := s.hcli.GetConsentRequest(consentGetParams)
+	if err != nil {
+		glog.Errorf("Cannot Accept Consent Request : %v", err)
+		http.Error(w, "Cannot Accept Consent Request", http.StatusBadRequest)
+		return
+	}
+
+	// 直接同意, 不做用户确认
+	payload := consentGetResp.GetPayload()
+	consentAcceptBody := &models.AcceptConsentRequest{
+		GrantAccessTokenAudience: payload.RequestedAccessTokenAudience,
+		GrantScope:               payload.RequestedScope,
+		Session: &models.ConsentRequestSession{
+			IDToken: consentGetResp.Payload.Context,
+		},
+	}
+
+	consentAcceptParams := admin.NewAcceptConsentRequestParams()
+	consentAcceptParams.WithContext(r.Context())
+	consentAcceptParams.SetConsentChallenge(consentChallenge)
+	consentAcceptParams.WithBody(consentAcceptBody)
+
+	consentAcceptResp, err := s.hcli.AcceptConsentRequest(consentAcceptParams)
+	if err != nil {
+		glog.Errorf("error AcceptConsentRequest : %v", err)
+		http.Error(w, "error AcceptConsentRequest", http.StatusBadRequest)
+		return
+	}
+
+	http.Redirect(w, r, *consentAcceptResp.GetPayload().RedirectTo, http.StatusFound)
 }
 
 func consentID(r *http.Request) string {
-	return r.URL.Query().Get("consent")
+	return r.URL.Query().Get("consent_challenge")
 }
 
-func getScopes(scopes []string) []string {
-	if contains(scopes, openIDScope) {
-		return scopes
-	}
-
-	r := []string{openIDScope}
-	r = append(r, scopes...)
-	return r
+func loginChallengeID(r *http.Request) string {
+	return r.URL.Query().Get("login_challenge")
 }
 
-func contains(values []string, s string) bool {
-	for _, i := range values {
-		if i == s {
-			return true
-		}
-	}
-
-	return false
-}
-
-func getAuthURL(consentID string) string {
-	return fmt.Sprintf("%s?consent=%s", pathAuth, consentID)
+func getAuthURL(loginChallenge string) string {
+	return fmt.Sprintf("%s?login_challenge=%s", pathAuth, loginChallenge)
 }
 
 func (s *Server) getTokenVars(uid string) (map[string]interface{}, error) {
@@ -182,11 +197,11 @@ func (s *Server) getTokenVars(uid string) (map[string]interface{}, error) {
 func (s *Server) collectUserInfo(uid string, vars map[string]interface{}) error {
 	userResp, err := s.wcli.GetUser(uid)
 	if err != nil {
-		return fmt.Errorf("Get wework user failed. %v", err)
+		return fmt.Errorf("get wework user failed. %v", err)
 	}
 
 	if userResp.Status != wework.UserActive {
-		return errors.New("User is not active")
+		return errors.New("user is not active")
 	}
 
 	vars["username"] = userResp.UserID
@@ -198,23 +213,16 @@ func (s *Server) collectUserInfo(uid string, vars map[string]interface{}) error 
 }
 
 func (s *Server) collectUserGroups(uid string, vars map[string]interface{}) error {
-	gs, _, err := s.hcli.ListGroups(subjectOf(uid), 100, 0)
-	if err != nil {
-		return fmt.Errorf("Get hydra warden groups failed. %v", err)
+	if groups, ok := s.groups[uid]; ok {
+		vars["groups"] = groups
+	} else {
+		vars["groups"] = []string{}
 	}
-
-	var groups []string
-	for _, g := range gs {
-		groups = append(groups, g.Id)
-	}
-
-	vars["groups"] = groups
-
 	return nil
 }
 
 func (s *Server) AuthHandler(w http.ResponseWriter, r *http.Request) {
-	state := r.URL.Query().Get("consent")
+	state := loginChallengeID(r)
 	callbackURL := getWeworkCallbackURL(s.cfg.HTTPS, r.Host)
 
 	var u string
@@ -250,19 +258,61 @@ func (s *Server) CallbackHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	glog.Infof("User signed in as wework user %v", uid)
-	session := s.session(r)
-	session.Values["uid"] = uid
-	session.Save(r, w)
+	loginChallenge := r.URL.Query().Get("state")
 
-	consentURL := getConsentURL(r.URL.Query().Get("state"))
-	http.Redirect(w, r, consentURL, http.StatusFound)
+	// Using Hydra Admin to accept login request!
+	loginGetParam := admin.NewGetLoginRequestParams()
+	loginGetParam.WithContext(r.Context())
+	loginGetParam.SetLoginChallenge(loginChallenge)
+
+	_, err = s.hcli.GetLoginRequest(loginGetParam)
+	if err != nil {
+		glog.Errorf("error GetLoginRequest: %v", err)
+		http.Error(w, "error GetLoginRequest", http.StatusInternalServerError)
+		return
+	}
+
+	s.acceptLoginRequest(w, r, userToSubject(uid), loginChallenge)
 }
 
-func getConsentURL(consentID string) string {
-	return fmt.Sprintf("%s?consent=%s", pathConsent, consentID)
+func (s *Server) acceptLoginRequest(
+	w http.ResponseWriter, r *http.Request, subject, loginChallenge string,
+) error {
+	extraVars, err := s.getTokenVars(subjectToUserID(subject))
+	if err != nil {
+		glog.Errorf("Get token extra vars error: %v", err)
+		http.Error(w, "Get user profile error", http.StatusInternalServerError)
+		return err
+	}
+
+	loginAcceptParam := admin.NewAcceptLoginRequestParams()
+	loginAcceptParam.WithContext(r.Context())
+	loginAcceptParam.SetLoginChallenge(loginChallenge)
+	loginAcceptParam.SetBody(&models.AcceptLoginRequest{
+		Subject:  &subject,
+		Remember: true,
+		Context:  extraVars,
+	})
+
+	respLoginAccept, err := s.hcli.AcceptLoginRequest(loginAcceptParam)
+	if err != nil {
+		glog.Errorf("error AcceptLoginRequest: %v", err)
+		http.Error(w, "error AcceptLoginRequest", http.StatusInternalServerError)
+		return err
+	}
+
+	http.Redirect(w, r, *respLoginAccept.GetPayload().RedirectTo, http.StatusFound)
+	return nil
 }
 
-func (s *Server) session(r *http.Request) *sessions.Session {
-	session, _ := s.store.Get(r, "identity_session")
-	return session
+func userToSubject(uid string) string {
+	return fmt.Sprintf("user:%s", uid)
+}
+
+func subjectToUserID(sub string) string {
+	if strings.HasPrefix(sub, "user:") {
+		return sub[len("user:"):]
+	} else {
+		return ""
+	}
 }
