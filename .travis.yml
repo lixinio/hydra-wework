@@ -6,7 +6,7 @@ services:
   - docker
 
 go:
-  - 1.9
+  - 1.15
 
 env:
   - DOCKER_IMAGE=pragkent/hydra-wework:0.8.3
