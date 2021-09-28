@@ -28,7 +28,7 @@ func parseFlags() (*server.Config, bool) {
 	var fs = flag.NewFlagSet(os.Args[0], flag.ExitOnError)
 
 	fs.StringVar(&cfg.BindAddr, "bind", ":6666", "bind address")
-	fs.StringVar(&cfg.CookieSecret, "cookie-secret", "", "session cookie secret key")
+	fs.StringVar(&cfg.GroupConfigPath, "group-config", "", "group config file path")
 	fs.StringVar(&cfg.HydraURL, "hydra-url", "", "hydra url")
 	fs.StringVar(&cfg.HydraClientID, "hydra-client-id", "", "hydra client id")
 	fs.StringVar(&cfg.HydraClientSecret, "hydra-client-secret", "", "hydra client secret")
