@@ -9,7 +9,7 @@ go:
   - 1.15
 
 env:
-  - DOCKER_IMAGE=pragkent/hydra-wework:0.8.3
+  - DOCKER_IMAGE=pragkent/hydra-wework:1.0.0
 
 script:
   - set -e
